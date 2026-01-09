@@ -35,6 +35,9 @@ RSI_LENGTH: 14
 RSI_UPPER_THRESHOLD: 50
 RSI_LOWER_THRESHOLD: 50
 
+PRICE_DISTANCE_TO_EMA: Decimal = Decimal("0.25")
+ENGULFING_MIN_BODY_SIZE: Decimal = Decimal("0.3")   
+
 DEFAULT_ORDER_UNITS: int = 1000
 
 # Type:
@@ -64,6 +67,9 @@ EMA_LENGTH = config_data.get("EMA_LENGTH", 200)
 RSI_LENGTH = config_data.get("RSI_LENGTH", 14)
 RSI_UPPER_THRESHOLD = config_data.get("RSI_UPPER_THRESHOLD", 50)
 RSI_LOWER_THRESHOLD = config_data.get("RSI_LOWER_THRESHOLD", 50)
+
+PRICE_DISTANCE_TO_EMA = config_data.get("PRICE_DISTANCE_TO_EMA", Decimal("0.25"))
+ENGULFING_MIN_BODY_SIZE = config_data.get("ENGULFING_MIN_BODY_SIZE", Decimal("0.3"))
 
 ORDER_UNITS = config_data.get("ORDER_UNITS", 6000)
 

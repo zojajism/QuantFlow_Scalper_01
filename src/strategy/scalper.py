@@ -129,6 +129,35 @@ def calculate_ema(
     
     return ema
 
+def calculate_atr(
+    candles: Deque[Dict[str, Any]],
+    period: int = 14
+) -> Optional[Decimal]:
+    """
+    Calculate the Average True Range (ATR) for a given candle series.
+    :param candles: Deque of dicts with 'high', 'low', 'close' keys.
+    :param period: ATR period (default 14)
+    :return: ATR value or None if not enough data
+    """
+    if len(candles) < period + 1:
+        return None
+
+    candles_list = list(candles)[- (period + 1):]  # Get the most recent period+1 candles
+    tr_list = []
+    for i in range(1, len(candles_list)):
+        high = Decimal(candles_list[i]["high"])
+        low = Decimal(candles_list[i]["low"])
+        prev_close = Decimal(candles_list[i - 1]["close"])
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        tr_list.append(tr)
+
+    atr = sum(tr_list) / Decimal(period)
+    return round(atr, 5)
+
 def calculate_rsi(
     candles: Deque[Dict[str, Any]],
     price_key: str = "close",
@@ -179,13 +208,25 @@ def calculate_rsi(
 
     return round(rsi, 5)
 
+def calc_price_to_ema(EMA: Decimal, ATR: Decimal, open: Decimal, close: Decimal) -> str: 
+    
+    price_to_ema = "N/A"
+
+    if EMA is not None and ATR is not None:
+        if close < EMA and open < EMA and (EMA - open) > (Decimal(ATR) * Decimal(public_module.PRICE_DISTANCE_TO_EMA)):
+            price_to_ema = "UNDER"
+        elif close > EMA and open > EMA and (open - EMA) > (Decimal(ATR) * Decimal(public_module.PRICE_DISTANCE_TO_EMA)):
+            price_to_ema = "UPPER"
+
+    return price_to_ema
+
 def _to_oanda_instrument(symbol: str) -> str:
     """
     Convert internal symbol like 'EUR/USD' to OANDA instrument 'EUR_USD'.
     """
     return symbol.replace("/", "_")
 
-def is_bullish_engulfing_candle(candles: Deque[Dict[str, Any]]) -> bool:
+def is_bullish_engulfing_candle(candles: Deque[Dict[str, Any]], ATR: Decimal) -> bool:
     if len(candles) < 2:
         return False
 
@@ -209,9 +250,12 @@ def is_bullish_engulfing_candle(candles: Deque[Dict[str, Any]]) -> bool:
     if curr_open > prev_close or curr_close < prev_open:
         return False
 
+    if abs(curr_close - curr_open) < (Decimal(ATR) * Decimal(public_module.ENGULFING_MIN_BODY_SIZE)):
+        return False
+    
     return True
 
-def is_bearish_engulfing_candle(candles: Deque[Dict[str, Any]]) -> bool:
+def is_bearish_engulfing_candle(candles: Deque[Dict[str, Any]], ATR: Decimal) -> bool:
     if len(candles) < 2:
         return False
 
@@ -235,6 +279,9 @@ def is_bearish_engulfing_candle(candles: Deque[Dict[str, Any]]) -> bool:
     if curr_open < prev_close or curr_close > prev_open:
         return False
 
+    if abs(curr_close - curr_open) < (Decimal(ATR) * Decimal(public_module.ENGULFING_MIN_BODY_SIZE)):
+        return False
+    
     return True
 
 
@@ -243,10 +290,12 @@ def manage_signal(
                     timeframe: str,
                     symbol: str, 
                     side: str, 
-                    target_price: Decimal,
-                    sl_price: Decimal,
                     event_time:datetime,
-                    position_price:Decimal,
+                    close:Decimal,
+                    high:Decimal,
+                    low:Decimal,
+                    EMA: Decimal, # for print log only
+                    RSI: Decimal, # for print log only
                     ):
     try:
         tick_registry = get_tick_registry()
@@ -258,6 +307,24 @@ def manage_signal(
                             side=side,
                             event_time=event_time,
                         )
+        
+        if side == "buy":
+            close_dec = close
+            low_dec = low
+            risk = close_dec - low_dec
+            position_price = position_price_Tick
+            sl_price = position_price - risk.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
+            target_price = position_price + ( risk * Decimal("1.5").quantize(Decimal("0.00001"), rounding=ROUND_DOWN) )
+
+        if side == "sell":
+            close_dec = close
+            high_dec = high
+            risk = high_dec - close_dec
+            position_price = position_price_Tick
+            sl_price = position_price + risk.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
+            target_price = position_price - ( risk * Decimal("1.5").quantize(Decimal("0.00001"), rounding=ROUND_DOWN) )
+
+        logger.info(f"Placing {side.upper()} order for {symbol}, EMA = {EMA}, RSI = {RSI}, target_price={target_price}, sl_price={sl_price}, event_time = {event_time.strftime('%Y-%m-%d %H:%M')}")
 
     except Exception as e:
         print(f"[ERROR] manage_signal failed to get entry price: {e}")
@@ -322,7 +389,6 @@ def manage_signal(
         print(f"[ORDER] HTTP error {status} from OANDA: {body}")
         order_info = None
 
-    '''
 
     if order_info is None:
         print(
@@ -359,6 +425,7 @@ def manage_signal(
             except Exception as te:
                 print(f"[WARN] telegram cancel notify failed: {te}")
         
+    '''
 
     # ------------------------------------------------
     # 8) Register OpenSignal (with optional order info)
@@ -433,7 +500,7 @@ def manage_signal(
             side,                   # position_type
             "",                    # price_source
             position_price,         # position_price
-            target_pips,            # target_pips (ADJUSTED, magnitude)
+            abs(target_pips),            # target_pips (ADJUSTED, magnitude)
             target_price,           # target_price (ADJUSTED)
             "",                    # ref_symbol (context)
             "",                    # ref_type (context)
@@ -448,6 +515,7 @@ def manage_signal(
   # ------------------------------------------------
     # 9) Queue DB updates for order-related columns
     # ------------------------------------------------
+    '''
     try:
         if order_info is not None:
             conn = get_pg_conn()
@@ -477,6 +545,8 @@ def manage_signal(
                 )])
     except Exception as e:
         print(f"[DB ERROR] update_signals_with_orders failed: {e}")
+
+    '''
 
     #sync_broker_orders(conn)
     

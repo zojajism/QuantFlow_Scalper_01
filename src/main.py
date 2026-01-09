@@ -30,7 +30,7 @@ from public_module import config_data
 from strategy.fx_correlation import refresh_correlation_cache
 from indicators.atr_15m import ATR_Update, get_latest_atr_15m
 
-from strategy.scalper import calculate_ema, calculate_rsi, is_bearish_engulfing_candle, is_bullish_engulfing_candle, manage_signal, truncate
+from strategy.scalper import calc_price_to_ema, calculate_atr, calculate_ema, calculate_rsi, is_bearish_engulfing_candle, is_bullish_engulfing_candle, manage_signal, truncate
 
 import public_module
 
@@ -95,6 +95,23 @@ async def main():
         open_sig_registry.bootstrap_from_db(DB_Conn) 
         open_count = open_sig_registry.get_count() 
         logger.info( json.dumps({ "EventCode": 0, "Message": f"open_sig_registry initialized. open_signals={open_count}" }) )
+        
+
+        '''
+        # Print data elements for one instance in open_sig_registry
+        if open_count > 0:
+            signals = open_sig_registry.get_all_signals()
+            if signals:
+                first_signal = signals[0]
+                print("First open signal data:")
+                if hasattr(first_signal, '__dict__'):
+                    for k, v in first_signal.__dict__.items():
+                        print(f"  {k}: {v}")
+                else:
+                    print(first_signal)
+        '''
+
+
 
         # --- Consumer 1: Tick Engine (receives NEW messages)
         try:
@@ -168,6 +185,15 @@ async def main():
                             #logger.info(f"Tick for {symbol}, tick_time:{parsed_time}")   
                             tick_registry = get_tick_registry()
                             tick_registry.update_tick(exchange, symbol, bid, ask, parsed_time)
+
+                            open_sig_registry.process_tick_for_symbol(
+                                exchange=exchange,
+                                symbol=symbol,
+                                bid=bid,
+                                ask=ask,
+                                now=parsed_time,
+                                conn=DB_Conn,   # or None if you handle DB elsewhere
+                            )
 
                         await msg.ack()
                 except Exception as e:
@@ -255,56 +281,44 @@ async def main():
                             except Exception as e:
                                 logger.error(f"Error calculating RSI for {symbol}: {e}")
 
-                            #Step 3: Check for Engulfing Candle
+                            #Step 3: Calculate ATR14
                             try:
-                                bearish_engulfing_candle = is_bearish_engulfing_candle(dq)
-                                bullish_engulfing_candle = is_bullish_engulfing_candle(dq)
+                                ATR = calculate_atr(dq)
+                            except Exception as e:
+                                logger.error(f"Error calculating ATR for {symbol}: {e}")
+
+                            #Step 4: Check for Engulfing Candle
+                            try:
+                                bearish_engulfing_candle = is_bearish_engulfing_candle(candles=dq, ATR=ATR)
+                                bullish_engulfing_candle = is_bullish_engulfing_candle(candles=dq, ATR=ATR)
                             except Exception as e:
                                 logger.error(f"Error checking Engulfing Candle for {symbol}: {e}")
 
-                            #Step 4: Check if Close price is under EMA200
-                            if EMA is not None:
-                                if candle_data["close"] < EMA:
-                                    price_to_ema = "UNDER"
-                                elif candle_data["close"] > EMA:
-                                    price_to_ema = "UPPER"
+                            #Step 5: Check if Close price is under EMA200
+                            try:
+                                price_to_ema = calc_price_to_ema(EMA, ATR, Decimal(str(candle_data["open"])), Decimal(str(candle_data["close"])))
+                            except Exception as e:
+                                logger.error(f"Error calculating Price to EMA for {symbol}: {e}")   
 
-                            logger.info(f"{symbol}, EMA = {EMA}, RSI = {RSI}, event_time = {candle_data['close_time'].strftime('%Y-%m-%d %H:%M')}, Price_to_EMA = {price_to_ema}, bearish_eng. = {bearish_engulfing_candle}, bullish_eng. = {bullish_engulfing_candle}")
+                            logger.info(f"{symbol}, EMA = {EMA}, RSI = {RSI}, ATR = {ATR}, event_time = {candle_data['close_time'].strftime('%Y-%m-%d %H:%M')}, Price_to_EMA = {price_to_ema}, bearish_eng. = {bearish_engulfing_candle}, bullish_eng. = {bullish_engulfing_candle}")
 
                             got_signal = False
                             side = ""
                             
+                            close_dec = Decimal(str(candle_data["close"]))
+                            low_dec = Decimal(str(candle_data["low"]))
+                            high_dec = Decimal(str(candle_data["high"]))
+
                             if price_to_ema == "UPPER" and RSI is not None and RSI > public_module.RSI_UPPER_THRESHOLD and bullish_engulfing_candle == True:
-                            #if Decimal(str(candle_data["close"])) > Decimal(str(candle_data["open"])):
-                                try:
-                                    close_dec = Decimal(str(candle_data["close"]))
-                                    low_dec = Decimal(str(candle_data["low"]))
-                                    sl_price = low_dec.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    risk = close_dec - low_dec
-                                    target_price = (close_dec + risk * Decimal("2")).quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    position_price = close_dec.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    side = "buy"    
-                                    got_signal = True
-                                except Exception as e:
-                                    logger.error(f"Error preparing BUY signal for {symbol}: {e}")
+                                side = "buy"    
+                                got_signal = True
 
                             if price_to_ema == "UNDER" and RSI is not None and RSI < public_module.RSI_LOWER_THRESHOLD and bearish_engulfing_candle == True:
-                            #if Decimal(str(candle_data["close"])) < Decimal(str(candle_data["open"])):
-                                try:
-                                    close_dec = Decimal(str(candle_data["close"]))
-                                    high_dec = Decimal(str(candle_data["high"]))
-                                    sl_price = high_dec.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    risk = high_dec - close_dec
-                                    target_price = (close_dec - risk * Decimal("2")).quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    position_price = close_dec.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-                                    side = "sell"
-                                    got_signal = True
-                                except Exception as e:
-                                    logger.error(f"Error preparing SELL signal for {symbol}: {e}")
+                                side = "sell"
+                                got_signal = True
                             
                             if got_signal == True:
-                                logger.info(f"Placing {side.upper()} order for {symbol}, EMA = {EMA}, RSI = {RSI}, target_price={target_price}, sl_price={sl_price}, event_time = {candle_data['close_time'].strftime('%Y-%m-%d %H:%M')}")
-                                manage_signal(exchange=exchange, timeframe=timeframe, symbol=symbol, side=side, target_price=target_price, sl_price=sl_price, event_time=candle_data["close_time"], position_price=position_price)
+                                manage_signal(exchange=exchange, timeframe=timeframe, symbol=symbol, side=side, event_time=candle_data["close_time"], close=close_dec, high=high_dec, low=low_dec)
 
                             
                            

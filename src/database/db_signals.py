@@ -116,10 +116,10 @@ def fetch_open_signals_for_open_registry(conn: psycopg.Connection) -> List[Dict[
             order_status,
             exec_latency_ms,
             nearest_pips_to_target,
-            farthest_pips_to_target
+            farthest_pips_to_target,
+            sl_price
         FROM public.signals
-        WHERE order_sent = true
-          AND order_status = 'open'
+        WHERE actual_exit_price IS NULL
         ORDER BY event_time ASC;
     """
 
@@ -144,6 +144,7 @@ def fetch_open_signals_for_open_registry(conn: psycopg.Connection) -> List[Dict[
             exec_latency_ms,
             nearest_pips_to_target,
             farthest_pips_to_target,
+            sl_price
         ) in cur.fetchall():
             rows.append(
                 {
@@ -171,6 +172,9 @@ def fetch_open_signals_for_open_registry(conn: psycopg.Connection) -> List[Dict[
                     # Distance metrics (may be NULL)
                     "nearest_pips_to_target": nearest_pips_to_target,
                     "farthest_pips_to_target": farthest_pips_to_target,
+                    
+                    "sl_price": sl_price,
+
                 }
             )
 

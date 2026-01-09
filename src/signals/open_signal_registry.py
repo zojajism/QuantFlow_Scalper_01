@@ -21,6 +21,8 @@ import logging
 
 from orders.order_executor import close_position_by_trade_id, update_position_sl_by_trade_id
 
+import public_module
+
 logger = logging.getLogger(__name__)
 
 def _pip_size(symbol: str) -> Decimal:
@@ -98,7 +100,16 @@ class OpenSignal:
     order_status: str = "none"               # none/pending/open/closed/...
     exec_latency_ms: Optional[int] = None
 
+    sl_price: Optional[Decimal] = None      # Stop Loss price
+    
+
 class OpenSignalRegistry:
+    
+    def get_all_signals(self) -> list:
+        """Return all OpenSignal instances as a flat list."""
+        with self._lock:
+            return [sig for signals in self._signals_by_symbol.values() for sig in signals]
+        
     """
     In-memory registry of open signals that we want to track with ticks.
 
@@ -181,6 +192,7 @@ class OpenSignalRegistry:
                     actual_tp_price=_to_decimal(row["actual_tp_price"]) if row.get("actual_tp_price") is not None else None,  # type: ignore
                     order_status=str(row.get("order_status") or "none"),
                     exec_latency_ms=row.get("exec_latency_ms"),
+                    sl_price=_to_decimal(row["sl_price"]) if row.get("sl_price") is not None else None,  # type: ignore
                 )
 
                 self._signals_by_symbol.setdefault(sig.symbol, []).append(sig)
@@ -304,11 +316,14 @@ class OpenSignalRegistry:
                 #   SELL -> ask
                 if sig.side.lower() == "buy":
                     price_to_check = Decimal(str(bid))
-                    hit = price_to_check >= sig.target_price
+                    hit_tp = price_to_check >= sig.target_price
+                    hit_sl = price_to_check <= sig.sl_price
                 else:
                     price_to_check = Decimal(str(ask))
-                    hit = price_to_check <= sig.target_price
+                    hit_tp = price_to_check <= sig.target_price
+                    hit_sl = price_to_check >= sig.sl_price
 
+                '''
                 # Save last tick price (side-based) and mark dirty
                 sig.last_tick_price = price_to_check
 
@@ -320,28 +335,32 @@ class OpenSignalRegistry:
 
                 # Apply trailing SL if applicable
                 self._apply_trailing_sl(sig=sig, current_price=price_to_check)
-
                 '''
-                if not hit:
+
+                
+                if not (hit_tp or hit_sl):
                     survivors.append(sig)
                     continue
 
-                # Signal reached its target
+                logger.info(f"Signal hit detected: symbol:{sig.symbol}, side:{sig.side}, event_time:{sig.event_time}, target_price:{sig.target_price}, hit_price:{price_to_check}, hit_time:{now}, TP_hit:{hit_tp}, SL_hit:{hit_sl}")
+
+                # Signal reached its SL or TP
                 self._on_signal_hit(
                     sig=sig,
                     hit_price=price_to_check,
                     hit_time=now,
+                    TP_hit=hit_tp,
                     conn=conn,
                 )
-                '''
-            '''
+                
+            
             # Update survivors list for this symbol
             if survivors:
                 self._signals_by_symbol[symbol] = survivors
             else:
                 # No more open signals on this symbol
                 self._signals_by_symbol.pop(symbol, None)
-            '''
+            
 
     def flush_distance_metrics(self, conn: psycopg.Connection) -> int:
         """
@@ -512,6 +531,7 @@ class OpenSignalRegistry:
         sig: OpenSignal,
         hit_price: Decimal,
         hit_time: datetime,
+        TP_hit: bool,
         conn: Optional[psycopg.Connection],
     ) -> None:
         """Handle a signal that has reached its target."""
@@ -520,32 +540,35 @@ class OpenSignalRegistry:
         try:
             # Calculate actual realized pips at hit
             pip_size = Decimal("0.01") if ("JPY" in sig.symbol or "DXY" in sig.symbol) else Decimal("0.0001")
-            pips_realized = (hit_price - sig.position_price) / pip_size
+            if sig.side.lower() == "buy":
+                pips_realized = (hit_price - sig.position_price) / pip_size
+            else:
+                pips_realized = (sig.position_price - hit_price) / pip_size
 
-            # For BUY, positive pips are profit; for SELL reverse sign
-            if sig.side.lower() == "sell":
-                pips_realized = -pips_realized
+            profit_usd = pips_realized * pip_size * public_module.ORDER_UNITS
 
-            # Dollar profit with assumed $5000 position size
-            profit_usd = pips_realized / Decimal("10000") * Decimal("5000")
-
-            '''
+            if TP_hit:
+                TP_SL_Sign = "🎯"
+            else:
+                TP_SL_Sign = "♨️"
+                
             msg = (
-                "🎯 TARGET HIT\n"
+                f"{TP_SL_Sign} CLOSE POSITION\n"
                 f"Symbol:         {sig.symbol}\n"
-                f"Side:           {sig.side.upper()}\n\n"
-                f"Entry price:    {sig.position_price}\n"
-                f"Target price:   {sig.target_price}\n"
-                f"Hit price:      {hit_price}\n\n"
+                f"Side:              {sig.side.upper()}\n\n"
+                f"Entry price:    {round(sig.position_price,5)}\n"
+                f"TP price:          {round(sig.target_price,5)}\n"
+                f"SL price:          {round(sig.sl_price,5)}\n"
+                f"Hit price:         {round(hit_price,5)}\n\n"
                 f"Pips gained:    {pips_realized:.1f}\n"
-                f"Profit:         ${profit_usd:.2f}\n\n"
+                f"Profit:             ${profit_usd:.2f}\n\n"
                 f"Event time:     {sig.event_time.strftime('%Y-%m-%d %H:%M')}\n"
-                f"Hit time:       {hit_time.strftime('%Y-%m-%d %H:%M')}\n"
+                f"Hit time:          {hit_time.strftime('%Y-%m-%d %H:%M')}\n"
             )
             
             notify_telegram(msg, ChatType.INFO)
             
-            '''
+            
             
         except Exception as e:
             print(f"[WARN] telegram notify (target hit) failed: {e}")
@@ -557,8 +580,8 @@ class OpenSignalRegistry:
         try:
             sql = """
                 UPDATE signals
-                   SET hit_price = %s,
-                       hit_time  = %s
+                   SET actual_exit_price = %s,
+                       actual_exit_time  = %s
                  WHERE signal_symbol = %s
                    AND position_type = %s
                    AND event_time    = %s
