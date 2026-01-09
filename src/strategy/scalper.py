@@ -60,7 +60,7 @@ def _insert_signals(conn: psycopg.Connection, rows: List[tuple]) -> None:
             cur.executemany(sql, rows)
         conn.commit()
     except Exception as e:
-        print("[DB ERROR] insert signals failed:", e)
+        logger.error("[DB ERROR] insert signals failed:", e)
 
 
 def _update_signals_with_orders(
@@ -327,7 +327,7 @@ def manage_signal(
         logger.info(f"Placing {side.upper()} order for {symbol}, EMA = {EMA}, RSI = {RSI}, target_price={target_price}, sl_price={sl_price}, event_time = {event_time.strftime('%Y-%m-%d %H:%M')}")
 
     except Exception as e:
-        print(f"[ERROR] manage_signal failed to get entry price: {e}")
+        logger.error(f"[ERROR] manage_signal failed to get entry price: {e}")
         position_price = Decimal(position_price)
 
     open_sig_registry = get_open_signal_registry()
@@ -347,7 +347,7 @@ def manage_signal(
         else:
             profit_est = (Decimal(public_module.ORDER_UNITS) * target_pips) / Decimal("10000")
     except Exception as e:
-        print(f"[ERROR] manage_signal pip/profit calc failed: {e}")
+        logger.error(f"[ERROR] manage_signal pip/profit calc failed: {e}")
     
     profit_est = truncate(profit_est, 2)
 
@@ -485,7 +485,7 @@ def manage_signal(
         )
         notify_telegram(msg, ChatType.INFO)
     except Exception as e:
-        print(f"[WARN] telegram notify failed: {e}")
+        logger.error(f"[WARN] telegram notify failed: {e}")
 
   
     # ------------------------------------------------
@@ -581,12 +581,14 @@ def _get_entry_price_with_tick_fallback(
             tick = tick_registry.get_last_tick(exchange, symbol)
         except Exception:
             tick = None
+            logger.error(f"[WARN] could not get tick for {symbol} from TickRegistry")
 
         if tick is not None and isinstance(event_time, datetime):
             try:
                 age_sec = abs((tick.time - event_time).total_seconds())
             except Exception:
                 age_sec = None
+                logger.error(f"[WARN] could not compute tick age for {symbol}")
 
             if age_sec is not None and age_sec <= MAX_TICK_AGE_SEC:
                 side_upper = side.upper()
